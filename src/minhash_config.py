@@ -50,3 +50,5 @@ class MinHashCFG:
     """A shingle's index column"""
     COL_COUNT = "count"
     """A shingle's occurrence column"""
+    
+    HASH_128BIT = ["xxh128", "md5"]

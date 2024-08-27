@@ -20,7 +20,9 @@ logger = logging.getLogger(__name__)
 class InMemoryMinHashLSH(MinHashCFG):
     """Class for performing MinHash LSH using Pandas DataFrame. See `MinHashCFG` for config"""
 
-    def __init__(self, documents: pd.DataFrame, do_cache_hash=True) -> None:
+    def __init__(
+        self, documents: pd.DataFrame, do_cache_hash=True, hash_fn="xxh128"
+    ) -> None:
         self.documents = documents
         """DataFrame storing documents, one per row.
         Index unique and increases, but not consecutive (when partitioned).
@@ -36,7 +38,7 @@ class InMemoryMinHashLSH(MinHashCFG):
         self.max_len = -1
         """Length of the longest shingled document"""
 
-        self.hash_family = [hash_family_gen(i) for i in range(self.NUM_HASH)]
+        self.hash_family = [hash_family_gen(i, hash_fn) for i in range(self.NUM_HASH)]
         """Family of hash functions to simulate permutation"""
 
         self.hash_dict: dict[int, np.ndarray] = dict()
@@ -47,6 +49,9 @@ class InMemoryMinHashLSH(MinHashCFG):
 
         self.lsh_df: pd.DataFrame | None = None
         self.do_cache_hash = do_cache_hash
+
+        self.is_64_bit_hash = hash_fn not in self.HASH_128BIT
+        self.dtype = np.uint64 if self.is_64_bit_hash else None
 
     def shingling(self, documents: pd.DataFrame) -> tuple[pd.DataFrame, float]:
         """Perform shingling step
@@ -103,7 +108,10 @@ class InMemoryMinHashLSH(MinHashCFG):
         logger.info("MinHashing")
         start_time = time.time()
         minhash_series: pd.Series = bool_vec[self.COL_BOOL_VEC].progress_apply(
-            hash_a_doc, num_hash=self.NUM_HASH, hash_dict=self.hash_dict
+            hash_a_doc,
+            num_hash=self.NUM_HASH,
+            hash_dict=self.hash_dict,
+            is_64_bit_hash=self.is_64_bit_hash,
         )
 
         minhash_df = minhash_series.to_frame(self.COL_SIG)
@@ -286,19 +294,18 @@ class InMemoryMinHashLSH(MinHashCFG):
         hash_dict = dict()  ## {<shing_idx>: <mh_arr>}
         for shing_idx in tqdm.tqdm(common_shing, desc="Precomputing minhashes"):
             hash_dict[shing_idx] = np.array(
-                [hash_fn(shing_idx) for hash_fn in self.hash_family]
+                [hash_fn(shing_idx) for hash_fn in self.hash_family],
+                dtype=self.dtype,
             )
 
         elapsed_time = time.time() - start_time
         logger.info(f"MinHashing process completed in {elapsed_time:.2f} seconds")
 
-        # print(hash_dict)
-        
         return hash_dict
 
     @classmethod
     def read_from_txt(
-        cls, filepath: str, do_cache_hash=True, trim: int = 0
+        cls, filepath: str, do_cache_hash=True, hash_fn="xxh128", trim: int = 0
     ) -> "InMemoryMinHashLSH":
         """Open text file as a Pandas DataFrame. Each line is a row.
 
@@ -324,4 +331,4 @@ class InMemoryMinHashLSH(MinHashCFG):
         logger.info(
             f"Load success. Received [{len(df)}] {filepath}. Took {elapsed_time} s"
         )
-        return InMemoryMinHashLSH(df, do_cache_hash)
+        return InMemoryMinHashLSH(df, do_cache_hash, hash_fn)

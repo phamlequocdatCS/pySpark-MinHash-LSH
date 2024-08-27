@@ -39,7 +39,10 @@ def bool_vectorizer(
 
 
 def hash_a_doc(
-    true_indices: list[int], num_hash: int, hash_dict: dict[int, np.ndarray]
+    true_indices: list[int],
+    num_hash: int,
+    hash_dict: dict[int, np.ndarray],
+    is_64_bit_hash = False,
 ) -> tuple[str, ...]:
     """Compute the MinHash signature of a document
 
@@ -53,8 +56,14 @@ def hash_a_doc(
         MinHash signature (tuple of minimal hashes, in hexadecimal string format)
     """
     # Initialize the hash vector with max int128
-    max_int = np.inf
-    min_hash_sig = np.full(num_hash, max_int)
+    if is_64_bit_hash:
+        dtype = np.uint64
+        max_int: int | float = np.iinfo(np.uint64).max
+    else:
+        dtype = None
+        max_int = np.inf
+
+    min_hash_sig = np.full(num_hash, max_int, dtype=dtype)
 
     # Create the family of hash fns
     # (pyspark cannot broadcast lambdas, so we need to create them in scope)
@@ -65,7 +74,7 @@ def hash_a_doc(
             hashed_vec = hash_dict[idx]
         else:  # Calculate as normal
             hashed_vec = np.array(
-                [hash_fn(idx) for hash_fn in hash_family]
+                [hash_fn(idx) for hash_fn in hash_family], dtype=dtype
             )
         min_hash_sig = np.minimum(min_hash_sig, hashed_vec)  # Element-wise min
 
@@ -102,6 +111,7 @@ def buckenize(
     #   Using python's hash gives bad results, potentionally because of collision rate
     band_buckets = [hash_to_int(band) % num_buckets for band in sig_bands]
     return list(set(band_buckets))
+
 
 def bucket_filter(buckets, query_buckets, bucket_thres):
     common_buckets = [bucket for bucket in buckets if bucket in query_buckets]
