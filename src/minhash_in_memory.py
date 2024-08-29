@@ -6,12 +6,21 @@ import numpy as np
 import pandas as pd
 import tqdm
 
+from pandarallel import pandarallel
+
 from .minhash_config import MinHashCFG
 from .minhash_utils import bool_vectorizer, buckenize, get_k_shingles, hash_a_doc
 from .utils import hash_family_gen, jaccard, tokenize
 
-tqdm.tqdm.pandas()
+try:
+    from pandarallel import pandarallel
+    pandarallel.initialize(progress_bar=True, nb_workers=4)
+    use_parallel = True
+except ImportError as e:
+    print(f"Revert to single-threaded. {e}")
+    use_parallel = False
 
+tqdm.tqdm.pandas()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -107,12 +116,20 @@ class InMemoryMinHashLSH(MinHashCFG):
         """
         logger.info("MinHashing")
         start_time = time.time()
-        minhash_series: pd.Series = bool_vec[self.COL_BOOL_VEC].progress_apply(
-            hash_a_doc,
-            num_hash=self.NUM_HASH,
-            hash_dict=self.hash_dict,
-            is_64_bit_hash=self.is_64_bit_hash,
-        )
+        if use_parallel:
+            minhash_series: pd.Series = bool_vec[self.COL_BOOL_VEC].parallel_apply(
+                hash_a_doc,
+                num_hash=self.NUM_HASH,
+                hash_dict=self.hash_dict,
+                is_64_bit_hash=self.is_64_bit_hash,
+            )
+        else:
+            minhash_series = bool_vec[self.COL_BOOL_VEC].progress_apply(
+                hash_a_doc,
+                num_hash=self.NUM_HASH,
+                hash_dict=self.hash_dict,
+                is_64_bit_hash=self.is_64_bit_hash,
+            )
 
         minhash_df = minhash_series.to_frame(self.COL_SIG)
         elapsed_time = time.time() - start_time
@@ -123,9 +140,9 @@ class InMemoryMinHashLSH(MinHashCFG):
         Returns: `str_mh_sig-<bucket>`, one row for each bucket it hashes to
         """
         buckets = buckenize(str_mh_sig, self.NUM_ROWS, self.NUM_BANDS, self.NUM_BUCKETS)
-
-        data = [(str_mh_sig, bucket) for bucket in buckets]
-        sig_df = pd.DataFrame(data, columns=[self.COL_SIG, self.COL_BUCKET])
+        sig_df = pd.DataFrame(
+            [[str_mh_sig, buckets]], columns=[self.COL_SIG, self.COL_BUCKETS]
+        )
         return sig_df
 
     def run(self) -> None:
@@ -183,16 +200,21 @@ class InMemoryMinHashLSH(MinHashCFG):
         )
         return minhash_sig, buckets
 
+    def any_bucket_in_list(self, bucket_list, buckets_to_check):
+        return any(bucket in bucket_list for bucket in buckets_to_check)
+
     def get_signatures_df(self, buckets: list[int]) -> pd.DataFrame:
         assert self.lsh_df is not None, "lsh_df is not initialized. Did you .run()?"
         # Get rows/signatures that are in the query's buckets
-        mask = self.lsh_df[self.COL_BUCKET].isin(buckets)
+        mask = self.lsh_df[self.COL_BUCKETS].apply(
+            lambda x: self.any_bucket_in_list(x, buckets)
+        )
 
         # Get rows that are in the query's buckets
         signatures = self.lsh_df.loc[mask, self.COL_SIG]
 
         # Get unique signatures
-        signatures = signatures.unique()
+        # signatures = signatures.unique()
         signatures_df = pd.DataFrame(signatures, columns=[self.COL_SIG])
 
         return signatures_df
@@ -209,6 +231,7 @@ class InMemoryMinHashLSH(MinHashCFG):
         minhash_sig, buckets = self.process_query(key)
 
         signatures_df = self.get_signatures_df(buckets)
+        print(f"Length of potential documents: {len(signatures_df)}")
 
         # Calculate jaccard
         signatures_df[self.COL_JACCARD] = signatures_df[self.COL_SIG].apply(
