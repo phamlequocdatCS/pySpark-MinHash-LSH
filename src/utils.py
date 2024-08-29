@@ -1,19 +1,8 @@
 import re
 from hashlib import md5
 
-
-# def hash_family_gen(seed: int):
-#     """Create a lambda hashing function given a seed.
-
-#     Input: seed (int)
-#     Returns: `lambda x: str(seed) + str(x) --> MD5 hex --> int`
-#     """
-#     # MD5   : 32-digit hexadecimal, 128-bit integer
-#     # SHA256: 64-digit hexadecimal, 256-bit integer
-
-#     return lambda x: int(md5((str(seed) + str(x)).encode("utf-8")).hexdigest(), 16)
-
 import xxhash
+
 
 def hash_family_gen(seed: int, algo="xxh128"):
     """Create a lambda hashing function given a seed.
@@ -25,7 +14,8 @@ def hash_family_gen(seed: int, algo="xxh128"):
         return lambda x: xxhash.xxh128(f"{seed}{x}".encode("utf-8"), seed=1).intdigest()
     else:
         return lambda x: int(md5(f"{seed}{x}".encode("utf-8")).hexdigest(), 16)
-    
+
+
 def jaccard(a: tuple[str, ...], b: tuple[str, ...]) -> float:
     """Compute element-wise MinHash jaccard approximation
 
@@ -46,14 +36,12 @@ def tokenize(text: str) -> list[str]:
     Input: text (str)
     Returns: list of tokens
     """
-    # Combine regular expressions for better performance
     text = re.sub(r"[^\w\s]", " ", text)  # Remove punctuation
     text = re.sub(r"\s+", " ", text)  # Remove extra spaces
     return text.lower().strip().split()
 
-# def hash_to_int(obj):
-#     return int(md5(obj.__repr__().encode("utf-8")).hexdigest(), 16)
 
 def hash_to_int(obj):
+    # return int(md5(obj.__repr__().encode("utf-8")).hexdigest(), 16)
     # return xxhash.xxh128(obj.__repr__().encode("utf-8")).intdigest()
     return xxhash.xxh32(obj.__repr__().encode("utf-8"), seed=1).intdigest()

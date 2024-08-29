@@ -5,7 +5,6 @@ import time
 import numpy as np
 import pandas as pd
 import tqdm
-
 from pandarallel import pandarallel
 
 from .minhash_config import MinHashCFG
@@ -14,6 +13,7 @@ from .utils import hash_family_gen, jaccard, tokenize
 
 try:
     from pandarallel import pandarallel
+
     pandarallel.initialize(progress_bar=True, nb_workers=4)
     use_parallel = True
 except ImportError as e:
@@ -328,7 +328,7 @@ class InMemoryMinHashLSH(MinHashCFG):
 
     @classmethod
     def read_from_txt(
-        cls, filepath: str, do_cache_hash=True, hash_fn="xxh128", trim: int = 0
+        cls, filepath: str, do_cache_hash=True, do_parallel = True, hash_fn="xxh128", trim: int = 0
     ) -> "InMemoryMinHashLSH":
         """Open text file as a Pandas DataFrame. Each line is a row.
 
@@ -354,4 +354,8 @@ class InMemoryMinHashLSH(MinHashCFG):
         logger.info(
             f"Load success. Received [{len(df)}] {filepath}. Took {elapsed_time} s"
         )
+        global use_parallel
+        if not do_parallel and use_parallel:
+            use_parallel = False
+            print(f"{use_parallel=}")
         return InMemoryMinHashLSH(df, do_cache_hash, hash_fn)
