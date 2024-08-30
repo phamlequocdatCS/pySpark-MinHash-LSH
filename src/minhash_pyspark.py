@@ -5,15 +5,17 @@ from typing import Any
 
 import numpy as np
 import pyspark.sql as sql
+from pyspark.broadcast import Broadcast
+from pyspark.context import SparkContext
 from pyspark.sql.functions import (
     col,
     explode,
     monotonically_increasing_id,
     udf,
 )
-from pyspark.sql.types import ArrayType, BooleanType, FloatType, IntegerType, StringType
-from pyspark.context import SparkContext
 from pyspark.sql.session import SparkSession
+from pyspark.sql.types import ArrayType, BooleanType, FloatType, IntegerType, StringType
+
 from .minhash_config import MinHashCFG
 from .minhash_pyspark_utils import is_memory_safe, py_is_memory_safe
 from .minhash_utils import (
@@ -29,15 +31,17 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
-class BigDataMinHashLSH(MinHashCFG):
+class PySparkMinHashLSH(MinHashCFG):
     """Class for performing MinHash LSH using PySpark DataFrame"""
 
-    def __init__(self, documents: sql.DataFrame, sc: SparkContext, sqlContext: SparkSession) -> None:
+    def __init__(
+        self, documents: sql.DataFrame, sc: SparkContext, sqlContext: SparkSession
+    ) -> None:
         self.sc = sc
         """The spark context"""
         self.sqlContext = sqlContext
         """The spark sql session"""
-        
+
         self.documents = documents
         """DataFrame storing documents, one per row.
         Index unique and increases, but not consecutive (when partitioned).
@@ -56,7 +60,6 @@ class BigDataMinHashLSH(MinHashCFG):
         Performance boost in minhashing step when `shing_len, num_hash` high.
         """
 
-        # self.fn_k_shingler: UserDefinedFunctionLike | None = None
         sc_num_shingles = self.broadcast(self.NUM_SHINGLES)
         self.fn_k_shingler = udf(
             lambda x: get_k_shingles(tokenize(x), sc_num_shingles.value),
@@ -76,7 +79,7 @@ class BigDataMinHashLSH(MinHashCFG):
         self.lsh_df: sql.DataFrame | None = None
         """DF Storing `<id>-<buckets>`"""
 
-    def broadcast(self, obj):
+    def broadcast(self, obj) -> Broadcast:
         return self.sc.broadcast(obj)
 
     def shingling(self, documents: sql.DataFrame) -> sql.DataFrame:
@@ -107,8 +110,8 @@ class BigDataMinHashLSH(MinHashCFG):
         #   Because of pyspark DF length limitations
         #   When shing_len very large -> dim(bool_vec) very large -> error
         #   We store list of true indices instead
-        #       Sparse vector also only store true indices
-        #       But still error with length too long
+        #   Sparse vector also only store true indices
+        #   But still error with length too long
         ## <id>-<true_indices>
         bool_vec = self._build_bool_vec(shing_df)
 
@@ -208,14 +211,37 @@ class BigDataMinHashLSH(MinHashCFG):
         ### Returns:
             Result DF `<id>-<text>-<jaccard>`
         """
-        tn_st = time.time()
+        nn_start_time = time.time()
 
         # Step 1: Get query's MH signature and buckets
         minhash_sig, buckets = self.process_query(key)
 
         bc_mh_sig = self.broadcast(minhash_sig)
-        bc_query_buckets = self.broadcast(buckets)
 
+        bucket_filterer_one, bucket_filterer = self.get_bucket_filter(
+            bucket_thres, buckets
+        )
+
+        # Step 2: Get candidate documents hashed into query's buckets
+        ## <id>
+        query_idxes = self.get_candidates(
+            bucket_thres, bucket_filterer_one, bucket_filterer
+        )
+
+        # Step 3: Get candidate documents' MH signatures
+        ## <id>-<signature>
+        assert self.minhash_df is not None, "Couldn't find minhash_df, did you .run()?"
+        result = self.minhash_df.join(query_idxes, on=[self.COL_ID], how="inner")
+
+        ## <id>-<text>-<jaccard>
+        result_df = self.get_result_df(n, result, bc_mh_sig)
+
+        total_elapsed_time = time.time() - nn_start_time
+        logger.info(f"Took {total_elapsed_time:.5f} s")
+        return result_df
+
+    def get_bucket_filter(self, bucket_thres: float, buckets: list[int]):
+        bc_query_buckets = self.broadcast(buckets)
         bucket_filterer_one = udf(
             lambda x: any(bucket in bc_query_buckets.value for bucket in x),
             BooleanType(),
@@ -232,26 +258,10 @@ class BigDataMinHashLSH(MinHashCFG):
             )
         else:
             bucket_filterer = bucket_filterer_one
+        return bucket_filterer_one, bucket_filterer
 
-        # Step 2: Get candidate documents hashed into query's buckets
-        ## <id>
-        query_idxes, query_res_count = self._filter_by_query(bucket_filterer)
-
-        if query_res_count == 0:
-            logger.info(
-                f"Found no result. Changing bucket_thres from {bucket_thres} to 0 (matching at least 1 bucket) "
-            )
-            query_idxes, query_res_count = self._filter_by_query(bucket_filterer_one)
-
-        logger.info(f"Found {query_res_count} candicate documents")
-
-        # Step 3: Get candidate documents' MH signatures
-        ## <id>-<signature>
-        assert self.minhash_df is not None, "Couldn't find minhash_df, did you .run()?"
-        result = self.minhash_df.join(query_idxes, on=[self.COL_ID], how="inner")
-
+    def get_result_df(self, n, result: sql.DataFrame, bc_mh_sig: Broadcast):
         jaccard_udf = udf(lambda x: jaccard(x, bc_mh_sig.value), FloatType())
-
         # Step 4: Compute Approx Jaccard Sim
         ## <id>-<signature>-<jaccard>
         result_jaccard = result.withColumn(
@@ -265,10 +275,12 @@ class BigDataMinHashLSH(MinHashCFG):
 
         # Step 6: Getting top n results
         logger.info(f"Collecting {n} results to driver")
-        jcl_t = time.time()
-        result_jaccard_collect = result_jaccard.head(n)
-        # This is done to preserve the sorted order
-        logger.info(f"Collecting took {time.time() - jcl_t:.5} s")
+        jaccard_collect_start_time = time.time()
+        result_jaccard_collect = result_jaccard.head(
+            n
+        )  # This is done to preserve the sorted order
+
+        logger.info(f"Collecting took {time.time() - jaccard_collect_start_time:.5} s")
 
         ## <id>-<jaccard>
         result_df: sql.DataFrame = self.sqlContext.createDataFrame(
@@ -279,8 +291,19 @@ class BigDataMinHashLSH(MinHashCFG):
         ## <id>-<text>-<jaccard>
         result_df = self.documents.join(result_df, on=[self.COL_ID], how="inner")
 
-        logger.info(f"Took {time.time() - tn_st:.5f} s")
         return result_df
+
+    def get_candidates(self, bucket_thres, bucket_filterer_one, bucket_filterer):
+        query_idxes, query_res_count = self._filter_by_query(bucket_filterer)
+
+        if query_res_count == 0:
+            logger.info(
+                f"Found no result. Changing bucket_thres from {bucket_thres} to 0 (matching at least 1 bucket) "
+            )
+            query_idxes, query_res_count = self._filter_by_query(bucket_filterer_one)
+
+        logger.info(f"Found {query_res_count} candicate documents")
+        return query_idxes
 
     def _filter_by_query(self, bucket_filter_udf):
         ## <id>-<bucket>
@@ -326,7 +349,7 @@ class BigDataMinHashLSH(MinHashCFG):
             shing_len: length of shing_dict
             collect_item_counts: list of `<shingle>-<count>` rows
         """
-        st = time.time()
+        start_time = time.time()
         logger.info("Building shing_dict")
         ## <shingles> -> [<shingle>]
         temp_df = shing_df.select(
@@ -357,8 +380,9 @@ class BigDataMinHashLSH(MinHashCFG):
 
         # Length of the bool vector
         shing_len = len(shing_dict)
+        elapsed_time = time.time() - start_time
         logger.info(
-            f"Shing_dict[len={shing_len}] build is done. Took {time.time() - st:.5f} s."
+            f"Shing_dict[len={shing_len}] build is done. Took {elapsed_time:.5f} s."
         )
 
         # Return collect_item_counts for the hash_dict step
@@ -375,7 +399,7 @@ class BigDataMinHashLSH(MinHashCFG):
         ### Returns:
             hash_dict `{<shing_idx>: <mh_arr>}`
         """
-        st = time.time()
+        start_time = time.time()
         # Use the collected item_counts df instead
         ## list of common shingles' index
         common_shing = [
@@ -401,9 +425,10 @@ class BigDataMinHashLSH(MinHashCFG):
                     f"hash_dict={est_size_gb} GB > {self.MAX_MEM_SIZE} GB. Please increase memory"
                 )
 
+        elapsed_time = time.time() - start_time
+
         logger.info(
-            f"Precomputed {len(hash_dict)} * {self.NUM_HASH} minhashes."
-            f"Took {time.time() - st:.5f} s"
+            f"Precomputed {len(hash_dict)} * {self.NUM_HASH} minhashes. Took {elapsed_time:.5f} s"
         )
         return hash_dict
 
@@ -424,13 +449,14 @@ class BigDataMinHashLSH(MinHashCFG):
     @classmethod
     def read_from_txt(
         cls, filepath: str, sc: SparkContext, sqlContext: SparkSession, trim: int = 0
-    ) -> "BigDataMinHashLSH":
+    ) -> "PySparkMinHashLSH":
         """Open text file as a PySpark DataFrame. Each line is a row.
         Order preserved, index unique and monotonically increasing, but not consecutive
 
         Optional Input: trim (int): Number of documents to take. By default loading all."""
-        assert os.path.isfile(filepath), f"Could not find file at: {filepath}"
-        st = time.time()
+        if not os.path.isfile(filepath):
+            raise ValueError(f"Could not find file at: {filepath}")
+        start_time = time.time()
         logger.info("Reading the file")
         # Read the text file into a DataFrame
         df: sql.DataFrame = sqlContext.read.text(filepath).withColumn(
@@ -443,10 +469,9 @@ class BigDataMinHashLSH(MinHashCFG):
 
         ## <text>-<id>
         df = df.withColumnRenamed("value", cls.COL_TEXT)
-
+        elapsed_time = time.time() - start_time
         logger.info(
-            f"Load success. Received [{df.count()}] {filepath}. "
-            f"Took {time.time() - st:.5f} s"
+            f"Load success. Received [{df.count()}] {filepath}. Took {elapsed_time:.5f} s"
         )
 
-        return BigDataMinHashLSH(df, sc, sqlContext)
+        return PySparkMinHashLSH(df, sc, sqlContext)
