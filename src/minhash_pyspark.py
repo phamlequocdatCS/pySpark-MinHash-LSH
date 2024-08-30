@@ -1,18 +1,21 @@
+import logging
 import os
-import sys
 import time
+from typing import Any
 
 import numpy as np
 import pyspark.sql as sql
 from pyspark.sql.functions import (
-    UserDefinedFunctionLike,
     col,
     explode,
     monotonically_increasing_id,
     udf,
 )
 from pyspark.sql.types import ArrayType, BooleanType, FloatType, IntegerType, StringType
-
+from pyspark.context import SparkContext
+from pyspark.sql.session import SparkSession
+from .minhash_config import MinHashCFG
+from .minhash_pyspark_utils import is_memory_safe, py_is_memory_safe
 from .minhash_utils import (
     bool_vectorizer,
     buckenize,
@@ -22,75 +25,19 @@ from .minhash_utils import (
 )
 from .utils import hash_family_gen, jaccard, tokenize
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-class BigDataMinHashLSH:
+
+class BigDataMinHashLSH(MinHashCFG):
     """Class for performing MinHash LSH using PySpark DataFrame"""
 
-    NUM_SHINGLES = 2
-    """Number of tokens per shingle"""
-    NUM_HASH = 100
-    """Number of hash functions to be generated and used for minhashing.\n
-    Higher = more accurate
-    [Wikipedia - MinHash](https://en.wikipedia.org/wiki/MinHash)
-    """
-    NUM_BANDS = 25
-    """Number of bands to split the MinHashes signature. Must be a divisor of num_hash"""
-    NUM_BUCKETS = 500
-    """Number of hash buckets to put bands into.\n
-    Higher = more documents to be filtered in the LSH step\n
-    [`num_buckets > num_doc`](https://stackoverflow.com/a/57790355)\n
-    [`num_buckets = sqrt(num_doc)`](https://stackoverflow.com/a/37274097)\n
-    `500` seems to be a good number. `5000` filters ~50%
-    """
-
-    NUM_ROWS = NUM_HASH // NUM_BANDS
-    """Length of the band."""
-
-    COMMON_THRES = 4  # Seems to be a good number
-    """Occurrence threshold for common shingle, used to avoid storing uncommon/rare
-    shingles in the hash_dict (appears only once or twice).
-    `4` seems to be a good number"""
-
-    MAX_MEM_SIZE = 2  # GB
-    """Maximum Memory Size, to check for big object collections"""
-    SAMPLE_FRACTION = 0.01  # 1%
-    """Fraction of the DataFrame object to sample for mem check"""
-    DO_SORT_SHING_DICT = True
-    """Sort `shing_dict` ascendingly to ensure consistency"""
-
-    HASH_DICT_MEM_CHECK_FREQ = 10_000
-    """Frequency of checking memory size of the `hash_dict`. Size grows as
-    `num_hash` increases"""
-
-    DO_CACHE = True
-    """Whether to cache `minhash_df` and `lsh_df`. Caching yields 2x speed up for dry run.
-    Uses more memory"""
-
-    COL_ID = "id"
-    """Index column"""
-    COL_TEXT = "text"
-    """Document's text column"""
-    COL_SIG = "signature"
-    """MinHash signature column"""
-    # COL_BUCKET = "bucket_id"
-    # """Bucket ID column (Unused)"""
-    COL_BUCKETS = "bucket_ids"
-    """List of bucket ids column"""
-    COL_SHINGLES = "shingles"
-    """List of shingles column"""
-    COL_BOOL_VEC = "bool_vec"
-    """Boolean vector true indices list column"""
-    COL_JACCARD = "jaccard"
-    """MinHash Jaccard similarity Approximation column"""
-
-    COL_SHINGLE = "shingle"
-    """A shingle column"""
-    COL_SHINGIDX = "shing_idx"
-    """A shingle's index column"""
-    COL_COUNT = "count"
-    """A shingle's occurrence column"""
-
-    def __init__(self, documents: sql.DataFrame, sc) -> None:
+    def __init__(self, documents: sql.DataFrame, sc: SparkContext, sqlContext: SparkSession) -> None:
+        self.sc = sc
+        """The spark context"""
+        self.sqlContext = sqlContext
+        """The spark sql session"""
+        
         self.documents = documents
         """DataFrame storing documents, one per row.
         Index unique and increases, but not consecutive (when partitioned).
@@ -109,22 +56,30 @@ class BigDataMinHashLSH:
         Performance boost in minhashing step when `shing_len, num_hash` high.
         """
 
-        self.fn_k_shingler: UserDefinedFunctionLike | None = None
+        # self.fn_k_shingler: UserDefinedFunctionLike | None = None
+        sc_num_shingles = self.broadcast(self.NUM_SHINGLES)
+        self.fn_k_shingler = udf(
+            lambda x: get_k_shingles(tokenize(x), sc_num_shingles.value),
+            ArrayType(ArrayType(StringType())),
+        )
         """UDF to perform shingling on DF"""
 
-        self.fn_bool_vectorizer: UserDefinedFunctionLike | None = None
+        self.fn_bool_vectorizer: Any | None = None
         """UDF to perform boolean vectorize DF (shingling step)"""
-        self.fn_hash_a_doc: UserDefinedFunctionLike | None = None
+        self.fn_hash_a_doc: Any | None = None
         """UDF to perform minhashing on DF"""
-        self.fn_lsh: UserDefinedFunctionLike | None = None
+        self.fn_lsh: Any | None = None
         """UDF to perform LSH Bucketing"""
 
-        self.minhash_df: sql.DataFrame = None  # type: ignore
+        self.minhash_df: sql.DataFrame | None = None
         """DF Storing `<id>-<signature>`"""
-        self.lsh_df: sql.DataFrame = None  # type: ignore
+        self.lsh_df: sql.DataFrame | None = None
         """DF Storing `<id>-<buckets>`"""
 
-    def shingling(self, documents: sql.DataFrame, sc) -> sql.DataFrame:
+    def broadcast(self, obj):
+        return self.sc.broadcast(obj)
+
+    def shingling(self, documents: sql.DataFrame) -> sql.DataFrame:
         """Perform shingling step
 
         Input: documents (sql.DataFrame) `<text>-<id>`
@@ -132,12 +87,6 @@ class BigDataMinHashLSH:
         """
 
         # Step 1: Shingling each document
-        sc_num_shingles = sc.broadcast(self.NUM_SHINGLES)
-        self.fn_k_shingler = udf(
-            lambda x: get_k_shingles(tokenize(x), sc_num_shingles.value),
-            ArrayType(ArrayType(StringType())),
-        )
-
         ## <text>-<id>-<shingles>
         shing_df = documents.withColumn(
             self.COL_SHINGLES, self.fn_k_shingler(col(self.COL_TEXT))
@@ -161,20 +110,18 @@ class BigDataMinHashLSH:
         #       Sparse vector also only store true indices
         #       But still error with length too long
         ## <id>-<true_indices>
-        bool_vec = self._build_bool_vec(shing_df, sc)
+        bool_vec = self._build_bool_vec(shing_df)
 
         return bool_vec
 
-    def minhashing(self, bool_vec: sql.DataFrame, sc) -> sql.DataFrame:
+    def minhashing(self, bool_vec: sql.DataFrame) -> sql.DataFrame:
         """Perform minhashing step
 
         Input: bool_vec (sql.DataFrame) `<id>-<true_indices>` (output of `shingling()`)
         Returns: minhash_df `<id>-<signature>`
         """
-
-        ## bool_vec: <id>-<true_indices>
-        bc_num_hash = sc.broadcast(self.NUM_HASH)
-        bc_hash_dict = sc.broadcast(self.hash_dict)
+        bc_num_hash = self.broadcast(self.NUM_HASH)
+        bc_hash_dict = self.broadcast(self.hash_dict)
 
         self.fn_hash_a_doc = udf(
             lambda x: hash_a_doc(x, bc_num_hash.value, bc_hash_dict.value),
@@ -191,16 +138,16 @@ class BigDataMinHashLSH:
 
         return minhash_df
 
-    def locality_sensity_hashing(self, minhash_df: sql.DataFrame, sc) -> sql.DataFrame:
+    def locality_sensity_hashing(self, minhash_df: sql.DataFrame) -> sql.DataFrame:
         """Perform LSH buckeing step
 
         Input: minhash_df `<id>-<signature>` (output of `minhashing()`)
         Returns: lsh_df `<id>-<buckets>`
         """
         ## minhash_df: <id>-<signature>
-        bc_num_rows = sc.broadcast(self.NUM_ROWS)
-        bc_num_bands = sc.broadcast(self.NUM_BANDS)
-        bc_num_buckets = sc.broadcast(self.NUM_BUCKETS)
+        bc_num_rows = self.broadcast(self.NUM_ROWS)
+        bc_num_bands = self.broadcast(self.NUM_BANDS)
+        bc_num_buckets = self.broadcast(self.NUM_BUCKETS)
 
         self.fn_lsh = udf(
             lambda x: buckenize(
@@ -214,12 +161,6 @@ class BigDataMinHashLSH:
 
         ## <id>-<buckets>
         lsh_df = lsh_df.select(self.COL_ID, self.COL_BUCKETS)
-
-        # This will time out pyspark
-        # ## <id>-<bucket>
-        # lsh_df = lsh_df.select(
-        #     self.COL_ID, explode(self.COL_BUCKETS).alias(self.COL_BUCKET)
-        # )
 
         return lsh_df
 
@@ -235,7 +176,7 @@ class BigDataMinHashLSH:
         if self.DO_CACHE:
             self.cache_dfs()
 
-        print("LSH Actions Completed.")
+        logger.info("LSH Actions Completed.")
 
     def process_query(self, query: str) -> tuple[list[str], list[int]]:
         """Perform all steps needed to do LSH Nearest Neighbor
@@ -254,7 +195,7 @@ class BigDataMinHashLSH:
         return list(minhash_sig), buckets
 
     def approxNearestNeighbors(
-        self, key: str, n: int, sc, sqlContext, bucket_thres=0.0
+        self, key: str, n: int, bucket_thres=0.0
     ) -> sql.DataFrame:
         """Perform Approximated Nearest Neighbors search
 
@@ -272,8 +213,8 @@ class BigDataMinHashLSH:
         # Step 1: Get query's MH signature and buckets
         minhash_sig, buckets = self.process_query(key)
 
-        bc_mh_sig = sc.broadcast(minhash_sig)
-        bc_query_buckets = sc.broadcast(buckets)
+        bc_mh_sig = self.broadcast(minhash_sig)
+        bc_query_buckets = self.broadcast(buckets)
 
         bucket_filterer_one = udf(
             lambda x: any(bucket in bc_query_buckets.value for bucket in x),
@@ -281,7 +222,7 @@ class BigDataMinHashLSH:
         )
 
         if bucket_thres > 0:
-            bc_bucket_thres = sc.broadcast(bucket_thres)
+            bc_bucket_thres = self.broadcast(bucket_thres)
 
             bucket_filterer = udf(
                 lambda x: bucket_filter(
@@ -297,15 +238,16 @@ class BigDataMinHashLSH:
         query_idxes, query_res_count = self._filter_by_query(bucket_filterer)
 
         if query_res_count == 0:
-            print(
+            logger.info(
                 f"Found no result. Changing bucket_thres from {bucket_thres} to 0 (matching at least 1 bucket) "
             )
             query_idxes, query_res_count = self._filter_by_query(bucket_filterer_one)
 
-        print(f"Found {query_res_count} candicate documents")
+        logger.info(f"Found {query_res_count} candicate documents")
 
         # Step 3: Get candidate documents' MH signatures
         ## <id>-<signature>
+        assert self.minhash_df is not None, "Couldn't find minhash_df, did you .run()?"
         result = self.minhash_df.join(query_idxes, on=[self.COL_ID], how="inner")
 
         jaccard_udf = udf(lambda x: jaccard(x, bc_mh_sig.value), FloatType())
@@ -322,14 +264,14 @@ class BigDataMinHashLSH:
         result_jaccard = result_jaccard.orderBy(result_jaccard[self.COL_JACCARD].desc())
 
         # Step 6: Getting top n results
-        print(f"Collecting {n} results to driver")
+        logger.info(f"Collecting {n} results to driver")
         jcl_t = time.time()
         result_jaccard_collect = result_jaccard.head(n)
         # This is done to preserve the sorted order
-        print(f"Collecting took {time.time() - jcl_t:.5} s")
+        logger.info(f"Collecting took {time.time() - jcl_t:.5} s")
 
         ## <id>-<jaccard>
-        result_df: sql.DataFrame = sqlContext.createDataFrame(
+        result_df: sql.DataFrame = self.sqlContext.createDataFrame(
             result_jaccard_collect, [self.COL_ID, self.COL_JACCARD]
         )
 
@@ -337,7 +279,7 @@ class BigDataMinHashLSH:
         ## <id>-<text>-<jaccard>
         result_df = self.documents.join(result_df, on=[self.COL_ID], how="inner")
 
-        print(f"Took {time.time() - tn_st:.5f} s")
+        logger.info(f"Took {time.time() - tn_st:.5f} s")
         return result_df
 
     def _filter_by_query(self, bucket_filter_udf):
@@ -351,13 +293,13 @@ class BigDataMinHashLSH:
 
         return query_idxes, query_res_count
 
-    def _build_bool_vec(self, shing_df: sql.DataFrame, sc) -> sql.DataFrame:
+    def _build_bool_vec(self, shing_df: sql.DataFrame) -> sql.DataFrame:
         """Build bool_vec df `<id>-<true_indices>`
 
         Input: shing_df (sql.DataFrame) `<id>-<shingles>`
         """
         ## shing_df: <id>-<shingles>
-        bc_shing_dict = sc.broadcast(self.shing_dict)
+        bc_shing_dict = self.broadcast(self.shing_dict)
 
         self.fn_bool_vectorizer = udf(
             lambda x: bool_vectorizer(x, bc_shing_dict.value), ArrayType(IntegerType())
@@ -385,7 +327,7 @@ class BigDataMinHashLSH:
             collect_item_counts: list of `<shingle>-<count>` rows
         """
         st = time.time()
-        print("Building shing_dict")
+        logger.info("Building shing_dict")
         ## <shingles> -> [<shingle>]
         temp_df = shing_df.select(
             explode(shing_df[self.COL_SHINGLES]).alias(self.COL_SHINGLE)
@@ -397,9 +339,14 @@ class BigDataMinHashLSH:
         if self.DO_SORT_SHING_DICT:
             item_counts = item_counts.sort(self.COL_SHINGLE)
 
-        assert self.is_memory_safe(
-            item_counts, "shing_dict"
-        ), f"shing_dict exceeds {self.MAX_MEM_SIZE} GB. Please increase memory"
+        est_size_gb, do_est_safe = is_memory_safe(
+            self.SAMPLE_FRACTION, self.MAX_MEM_SIZE, item_counts, "shing_dict"
+        )
+
+        if not do_est_safe:
+            raise MemoryError(
+                f"shing_dict={est_size_gb} GB > {self.MAX_MEM_SIZE} GB. Please increase memory"
+            )
 
         collect_item_counts = item_counts.collect()
 
@@ -410,7 +357,7 @@ class BigDataMinHashLSH:
 
         # Length of the bool vector
         shing_len = len(shing_dict)
-        print(
+        logger.info(
             f"Shing_dict[len={shing_len}] build is done. Took {time.time() - st:.5f} s."
         )
 
@@ -439,7 +386,7 @@ class BigDataMinHashLSH:
 
         common_shing_set = set(common_shing)
 
-        print("Precomputing minhashes")
+        logger.info("Precomputing minhashes")
         # Precompute MinHashes
         # (Since we can't modify the hash_dict while computing on the RDD)
         hash_dict = dict()  ## {<shing_idx>: <mh_arr>}
@@ -448,66 +395,35 @@ class BigDataMinHashLSH:
             hash_dict[shing_idx] = np.array(
                 [hash_fn(shing_idx) for hash_fn in self.hash_family]
             )
-            if i % self.HASH_DICT_MEM_CHECK_FREQ == 0 and not self.py_is_memory_safe(
-                hash_dict
-            ):
-                break
+            est_size_gb, do_est_safe = py_is_memory_safe(hash_dict, self.MAX_MEM_SIZE)
+            if i % self.HASH_DICT_MEM_CHECK_FREQ == 0 and not do_est_safe:
+                raise MemoryError(
+                    f"hash_dict={est_size_gb} GB > {self.MAX_MEM_SIZE} GB. Please increase memory"
+                )
 
-        print(
+        logger.info(
             f"Precomputed {len(hash_dict)} * {self.NUM_HASH} minhashes."
             f"Took {time.time() - st:.5f} s"
         )
         return hash_dict
 
-    def is_memory_safe(self, df: sql.DataFrame, obj_name: str = "object") -> bool:
-        """Check if DF's size is smaller than `MAX_MEM_SIZE`, by sampling a
-        fraction and extrapolate
-        ### Inputs:
-            df (sql.DataFrame): A PySpark DataFrame
-            obj_name (str) = `'object'`: Name of the object to display message
-        ### Returns:
-            `True` if size(df) approximately < `MAX_MEM_SIZE`
-        """
-        # Sample x% of the DataFrame
-        sample_df = df.sample(self.SAMPLE_FRACTION)
-        # Collect the sample to the driver node
-        # Measure the size of the sample
-        sample_size = sys.getsizeof(sample_df.collect())
-        # Estimate the size of the full DataFrame (in GB)
-        est_size_byte = sample_size / self.SAMPLE_FRACTION
-        est_size_mb = est_size_byte / (1024**2)
-        est_size_gb = est_size_byte / (1024**3)
-        print(f"Estimated {obj_name} size: {est_size_gb:.5f} GB [{est_size_mb:.5f} MB].\
-            Max Memory size: {self.MAX_MEM_SIZE} GB")
-        if est_size_gb < self.MAX_MEM_SIZE:
-            return True
-        return False
-
-    def py_is_memory_safe(self, obj) -> bool:
-        """Check if object is smaller than `MAX_MEM_SIZE`. Return `True` if it is"""
-        est_size_byte = sys.getsizeof(obj)
-        est_size_gb = est_size_byte / (1024**3)
-        if est_size_gb < self.MAX_MEM_SIZE:
-            return True
-        return False
-
     def cache_dfs(self):
         """Caching minhash_df and lsh_df for faster processing (Memory intensive)"""
-        print("Caching minhash_df and lsh_df")
+        logger.info("Caching minhash_df and lsh_df")
         self.minhash_df.cache()
         self.lsh_df.cache()
-        print("Caching done")
+        logger.info("Caching done")
 
     def free_dfs(self):
         """Clearing cached minhash_df and lsh_df"""
-        print("Clearing minhash_df and lsh_df")
+        logger.info("Clearing minhash_df and lsh_df")
         self.minhash_df.unpersist()
         self.lsh_df.unpersist()
-        print("Clearing done")
+        logger.info("Clearing done")
 
     @classmethod
     def read_from_txt(
-        cls, filepath: str, sc, sqlContext, trim: int = 0
+        cls, filepath: str, sc: SparkContext, sqlContext: SparkSession, trim: int = 0
     ) -> "BigDataMinHashLSH":
         """Open text file as a PySpark DataFrame. Each line is a row.
         Order preserved, index unique and monotonically increasing, but not consecutive
@@ -515,21 +431,22 @@ class BigDataMinHashLSH:
         Optional Input: trim (int): Number of documents to take. By default loading all."""
         assert os.path.isfile(filepath), f"Could not find file at: {filepath}"
         st = time.time()
-
+        logger.info("Reading the file")
         # Read the text file into a DataFrame
         df: sql.DataFrame = sqlContext.read.text(filepath).withColumn(
             cls.COL_ID, monotonically_increasing_id()
         )
 
         if trim > 0:
+            logger.info("Trimming")
             df = df.limit(trim)
 
         ## <text>-<id>
         df = df.withColumnRenamed("value", cls.COL_TEXT)
 
-        print(
+        logger.info(
             f"Load success. Received [{df.count()}] {filepath}. "
             f"Took {time.time() - st:.5f} s"
         )
 
-        return BigDataMinHashLSH(df, sc)
+        return BigDataMinHashLSH(df, sc, sqlContext)

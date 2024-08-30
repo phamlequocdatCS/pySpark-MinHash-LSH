@@ -231,7 +231,7 @@ class InMemoryMinHashLSH(MinHashCFG):
         minhash_sig, buckets = self.process_query(key)
 
         signatures_df = self.get_signatures_df(buckets)
-        print(f"Length of potential documents: {len(signatures_df)}")
+        logger.info(f"Length of potential documents: {len(signatures_df)}")
 
         # Calculate jaccard
         signatures_df[self.COL_JACCARD] = signatures_df[self.COL_SIG].apply(

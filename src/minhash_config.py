@@ -52,3 +52,16 @@ class MinHashCFG:
     """A shingle's occurrence column"""
     
     HASH_128BIT = ["xxh128", "md5"]
+    
+    ### PYSPARK SPECIFIC
+    MAX_MEM_SIZE = 2 
+    """Maximum Memory Size in GB, to check for big object collections."""
+    SAMPLE_FRACTION = 0.01 
+    """Percentage (%) of the DataFrame object to sample for mem check"""
+    HASH_DICT_MEM_CHECK_FREQ = 10_000
+    """Frequency of checking memory size of the `hash_dict`. Size grows as
+    `num_hash` increases"""
+    DO_CACHE = True
+    """Whether to cache `minhash_df` and `lsh_df`. Caching yields 2x speed up for dry run.
+    Uses more memory"""
+    
