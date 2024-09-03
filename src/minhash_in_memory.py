@@ -5,7 +5,6 @@ import time
 import numpy as np
 import pandas as pd
 import tqdm
-from pandarallel import pandarallel
 
 from .minhash_config import MinHashCFG
 from .minhash_utils import bool_vectorizer, buckenize, get_k_shingles, hash_a_doc
